@@ -5,60 +5,174 @@ on:
     branches: [ "main" ]
 
 jobs:
-  deploy:
+  provision:
     runs-on: ubuntu-latest
     env:
-      SSH_HOST: ${{ secrets.SSH_HOST }}         # IP público da VM
-      SSH_USER: ${{ secrets.SSH_USER }}         # normalmente 'ubuntu'
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      COMMIT_MSG: ${{ github.event.head_commit.message }}
-      COMMIT_SHA: ${{ github.sha }}
-
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python (para checar dependências, opcional)
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Prepare artifact (requirements + app)
-        run: |
-          echo "Conteúdo do repo:"
-          ls -la
-
       - name: Add SSH key
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Copy files to remote (staging)
+      - name: Provision VM
+        run: |
+          ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST bash -eux <<'EOF'
+            sudo apt-get update
+            sudo apt-get install -y python3 python3-venv python3-pip nginx rsync
+
+            sudo mkdir -p /opt/hello/app /opt/hello/backups
+
+            if [ ! -d /opt/hello/venv ]; then
+              sudo python3 -m venv /opt/hello/venv
+              sudo /opt/hello/venv/bin/pip install --upgrade pip
+              sudo /opt/hello/venv/bin/pip install flask gunicorn requests
+            fi
+
+            sudo tee /etc/systemd/system/hello.service > /dev/null <<'SERVICE'
+            [Unit]
+            Description=Hello Gunicorn Service
+            After=network.target
+
+            [Service]
+            User=root
+            WorkingDirectory=/opt/hello/app
+            ExecStart=/opt/hello/venv/bin/gunicorn -w 2 -b 127.0.0.1:8000 app:app
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICE
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable hello
+
+            sudo tee /etc/nginx/sites-available/hello > /dev/null <<'NGINX'
+            server {
+                listen 80;
+                location / {
+                    proxy_pass http://127.0.0.1:8000;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                }
+            }
+            NGINX
+
+            sudo ln -sf /etc/nginx/sites-available/hello /etc/nginx/sites-enabled/hello
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            sudo tee /opt/hello/deploy.sh > /dev/null <<'DEPLOY'
+            #!/bin/bash
+            set -eux
+
+            TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+            if [ "$(ls -A /opt/hello/app)" ]; then
+              tar czf /opt/hello/backups/app-backup-$TIMESTAMP.tar.gz -C /opt/hello app
+            fi
+
+            rm -rf /opt/hello/app.old || true
+            if [ -d /opt/hello/app ]; then
+              mv /opt/hello/app /opt/hello/app.old
+            fi
+            mv /opt/hello/app.new /opt/hello/app
+
+            if [ -f /opt/hello/app/requirements.txt ]; then
+              /opt/hello/venv/bin/pip install -r /opt/hello/app/requirements.txt
+            else
+              /opt/hello/venv/bin/pip install --upgrade flask gunicorn requests
+            fi
+
+            systemctl restart hello || true
+            systemctl status hello || true
+            DEPLOY
+
+            sudo chmod +x /opt/hello/deploy.sh
+          EOF
+
+  build:
+    runs-on: ubuntu-latest
+    needs: provision
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-src
+          path: |
+            ./
+          exclude: |
+            .git
+            venv
+
+  deliver:
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+    steps:
+      - name: Add SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-src
+
+      - name: Sync files to remote
         run: |
           ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST "rm -rf /opt/hello/app.new && mkdir -p /opt/hello/app.new"
-          rsync -az --delete \
-            --exclude ".git" --exclude ".github" --exclude "venv" \
-            ./ $SSH_USER@$SSH_HOST:/opt/hello/app.new/
+          rsync -az --delete --exclude ".git" --exclude "venv" ./ $SSH_USER@$SSH_HOST:/opt/hello/app.new/
 
-      - name: Run remote deploy (with backup)
-        id: deploy
-        run: |
-          ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST "bash /opt/hello/deploy.sh"
+  deploy:
+    runs-on: ubuntu-latest
+    needs: deliver
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+    steps:
+      - name: Add SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Notify Discord (success)
-        if: success()
-        run: |
-          STATUS="✅ Deploy OK"
-          CONTENT="**${STATUS}**\nRepo: $GITHUB_REPOSITORY\nBranch: ${{ github.ref_name }}\nAutor: ${{ github.event.head_commit.author.name }}\nCommit: ${COMMIT_SHA}\nMensagem: ${COMMIT_MSG}"
-          curl -H "Content-Type: application/json" -X POST \
-            -d "{\"content\": \"${CONTENT}\"}" \
-            "$DISCORD_WEBHOOK_URL"
+      - name: Run remote deploy
+        run: ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST "bash /opt/hello/deploy.sh"
 
-      - name: Notify Discord (failure)
-        if: failure()
+  notify:
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      COMMIT_MSG: ${{ github.event.head_commit.message }}
+      COMMIT_SHA: ${{ github.sha }}
+      AUTHOR: ${{ github.event.head_commit.author.name }}
+      REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - name: Notify Discord
         run: |
-          STATUS="❌ Deploy falhou"
-          CONTENT="**${STATUS}**\nRepo: $GITHUB_REPOSITORY\nBranch: ${{ github.ref_name }}\nAutor: ${{ github.event.head_commit.author.name }}\nCommit: ${COMMIT_SHA}\nMensagem: ${COMMIT_MSG}"
+          if [ "${{ needs.deploy.result }}" = "success" ]; then
+            STATUS="✅ Deploy OK"
+          else
+            STATUS="❌ Deploy falhou"
+          fi
+          CONTENT="**${STATUS}**\nRepo: $REPO\nBranch: $BRANCH\nAutor: $AUTHOR\nCommit: $COMMIT_SHA\nMensagem: $COMMIT_MSG"
           curl -H "Content-Type: application/json" -X POST \
             -d "{\"content\": \"${CONTENT}\"}" \
             "$DISCORD_WEBHOOK_URL"
