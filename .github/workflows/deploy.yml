@@ -1,0 +1,64 @@
+name: Deploy to OCI
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}         # IP público da VM
+      SSH_USER: ${{ secrets.SSH_USER }}         # normalmente 'ubuntu'
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      COMMIT_MSG: ${{ github.event.head_commit.message }}
+      COMMIT_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python (para checar dependências, opcional)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare artifact (requirements + app)
+        run: |
+          echo "Conteúdo do repo:"
+          ls -la
+
+      - name: Add SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Copy files to remote (staging)
+        run: |
+          ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST "rm -rf /opt/hello/app.new && mkdir -p /opt/hello/app.new"
+          rsync -az --delete \
+            --exclude ".git" --exclude ".github" --exclude "venv" \
+            ./ $SSH_USER@$SSH_HOST:/opt/hello/app.new/
+
+      - name: Run remote deploy (with backup)
+        id: deploy
+        run: |
+          ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST "bash /opt/hello/deploy.sh"
+
+      - name: Notify Discord (success)
+        if: success()
+        run: |
+          STATUS="✅ Deploy OK"
+          CONTENT="**${STATUS}**\nRepo: $GITHUB_REPOSITORY\nBranch: ${{ github.ref_name }}\nAutor: ${{ github.event.head_commit.author.name }}\nCommit: ${COMMIT_SHA}\nMensagem: ${COMMIT_MSG}"
+          curl -H "Content-Type: application/json" -X POST \
+            -d "{\"content\": \"${CONTENT}\"}" \
+            "$DISCORD_WEBHOOK_URL"
+
+      - name: Notify Discord (failure)
+        if: failure()
+        run: |
+          STATUS="❌ Deploy falhou"
+          CONTENT="**${STATUS}**\nRepo: $GITHUB_REPOSITORY\nBranch: ${{ github.ref_name }}\nAutor: ${{ github.event.head_commit.author.name }}\nCommit: ${COMMIT_SHA}\nMensagem: ${COMMIT_MSG}"
+          curl -H "Content-Type: application/json" -X POST \
+            -d "{\"content\": \"${CONTENT}\"}" \
+            "$DISCORD_WEBHOOK_URL"
